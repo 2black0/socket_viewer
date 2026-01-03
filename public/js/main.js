@@ -18,10 +18,10 @@ let receiveTimestamp = 0;
 let property = {
     CameraMode: 'Follow',
     FixAngle: true,
-    LandmarkSize: 0.6,
-    KeyframeSize: 0.5,
-    CurrentFrameSize: 1.0,
-    DrawGraph: true,
+    LandmarkSize: 0.0,
+    KeyframeSize: 0.0,
+    CurrentFrameSize: 0.8,
+    DrawGraph: false,
     DrawGrid: true,
     DrawPoints: true,
     LocalizationMode: false,
@@ -38,6 +38,17 @@ let cameraFrames = new CameraFrames();
 let pointUpdateFlag = false;
 let pointCloud = new PointCloud();
 let markerIndicators = new MarkerIndicators();
+let posePanel;
+let poseUpdatedLabel;
+let poseBody;
+let gpsPanel;
+let gpsUpdatedLabel;
+let gpsBody;
+let slam2gpsActive = false;
+let calibrateActive = false;
+let visualSlamActive = false;
+let csvRecording = false;
+let telemetryPollTimer = null;
 
 let grid;
 
@@ -125,6 +136,9 @@ function init() {
 
     // animation render function
     render();
+    initTelemetryPanels();
+    initControlPanel();
+    scheduleTelemetryPoll();
 
 }
 
@@ -154,6 +168,7 @@ function render() {
 // initialize gui by dat.gui
 function initGui() {
     let gui = new dat.GUI({ width: 300 });
+    gui.close();
 
     gui.add(property, 'CameraMode', ['Above', 'Follow', 'Bird', 'Subjective']).onChange(setCameraMode);
     gui.add(property, 'FixAngle').onChange(toggleFixAngle);
@@ -317,6 +332,7 @@ function updateMapElements(msgSize, keyframes, edges, points, referencePointIds,
     trackStats.update();
     cameraFrames.updateCurrentFrame(currentFramePose);
     viewControls.setCurrentIntrinsic(currentFramePose);
+    updatePosePanel(currentFramePose);
 
     if (cameraFrames.numValidKeyframe == 0 && keyframes.length == 0) {
         return;
@@ -410,6 +426,362 @@ function removeAllElements() {
     cameraFrames.setEdges([]);
 
     markerIndicators.scheduleRemoveAll();
+}
+
+function initTelemetryPanels() {
+    posePanel = document.getElementById("pose-panel");
+    poseUpdatedLabel = document.getElementById("pose-updated");
+    poseBody = document.getElementById("pose-body");
+    gpsPanel = document.getElementById("gps-panel");
+    gpsUpdatedLabel = document.getElementById("gps-updated");
+    gpsBody = document.getElementById("gps-body");
+}
+
+function normalizeNumber(value) {
+    if (typeof value === "number") {
+        return Number.isFinite(value) ? value : null;
+    }
+    if (typeof value === "string") {
+        const parsed = Number(value.trim());
+        return Number.isFinite(parsed) ? parsed : null;
+    }
+    return null;
+}
+
+function formatNumber(value, digits = 3) {
+    const num = normalizeNumber(value);
+    if (num === null) {
+        return "--";
+    }
+    return num.toFixed(digits);
+}
+
+function formatMillis(value) {
+    const num = normalizeNumber(value);
+    if (num === null) {
+        return "--";
+    }
+    return `${Math.round(num)} ms`;
+}
+
+function updatePosePanel(currentFramePose) {
+    if (!poseBody || !poseUpdatedLabel) {
+        return;
+    }
+    if (!Array.isArray(currentFramePose) || currentFramePose.length !== 4) {
+        poseBody.textContent = "Waiting for pose data...";
+        poseUpdatedLabel.textContent = "Updated: --";
+        return;
+    }
+    
+    // Extract pose matrix components (following get_slam.py convention)
+    const r00 = currentFramePose[0][0], r01 = currentFramePose[0][1], r02 = currentFramePose[0][2], tx = currentFramePose[0][3];
+    const r10 = currentFramePose[1][0], r11 = currentFramePose[1][1], r12 = currentFramePose[1][2], ty = currentFramePose[1][3];
+    const r20 = currentFramePose[2][0], r21 = currentFramePose[2][1], r22 = currentFramePose[2][2], tz = currentFramePose[2][3];
+    
+    // Calculate camera position in world frame (same as get_slam.py and app.js)
+    // translation = -R^T * t
+    const x = -(r00 * tx + r10 * ty + r20 * tz);
+    const y = -(r01 * tx + r11 * ty + r21 * tz);
+    const z = -(r02 * tx + r12 * ty + r22 * tz);
+    
+    // Convert rotation matrix to quaternion (same algorithm as get_slam.py and app.js)
+    const trace = r00 + r11 + r22;
+    let qw, qx, qy, qz;
+    
+    if (trace > 0) {
+        const s = Math.sqrt(trace + 1.0) * 2.0;
+        qw = 0.25 * s;
+        qx = (r21 - r12) / s;
+        qy = (r02 - r20) / s;
+        qz = (r10 - r01) / s;
+    } else if (r00 > r11 && r00 > r22) {
+        const s = Math.sqrt(1.0 + r00 - r11 - r22) * 2.0;
+        qw = (r21 - r12) / s;
+        qx = 0.25 * s;
+        qy = (r01 + r10) / s;
+        qz = (r02 + r20) / s;
+    } else if (r11 > r22) {
+        const s = Math.sqrt(1.0 + r11 - r00 - r22) * 2.0;
+        qw = (r02 - r20) / s;
+        qx = (r01 + r10) / s;
+        qy = 0.25 * s;
+        qz = (r12 + r21) / s;
+    } else {
+        const s = Math.sqrt(1.0 + r22 - r00 - r11) * 2.0;
+        qw = (r10 - r01) / s;
+        qx = (r02 + r20) / s;
+        qy = (r12 + r21) / s;
+        qz = 0.25 * s;
+    }
+    
+    const now = new Date().toLocaleTimeString();
+    poseUpdatedLabel.textContent = `Updated: ${now}`;
+    
+    poseBody.innerHTML = `
+        <div>Position (Camera)</div>
+        <div>x: ${formatNumber(x)}</div>
+        <div>y: ${formatNumber(y)}</div>
+        <div>z: ${formatNumber(z)}</div>
+        <div style="margin-top:6px;">Quaternion</div>
+        <div>w: ${formatNumber(qw, 4)}</div>
+        <div>x: ${formatNumber(qx, 4)}</div>
+        <div>y: ${formatNumber(qy, 4)}</div>
+        <div>z: ${formatNumber(qz, 4)}</div>
+    `;
+}
+
+function updateMavlinkPanel(data) {
+    if (!gpsBody || !gpsUpdatedLabel) {
+        return;
+    }
+    if (!data) {
+        gpsBody.textContent = "Waiting for telemetry...";
+        gpsUpdatedLabel.textContent = "Updated: --";
+        return;
+    }
+    const updatedAt =
+        typeof data.lastUpdate === "number"
+            ? new Date(data.lastUpdate).toLocaleTimeString()
+            : new Date().toLocaleTimeString();
+    gpsUpdatedLabel.textContent = `Updated: ${updatedAt}`;
+    const modeText = data.mode || data.mode_name || data.modeName || "Unknown";
+    const lat = formatNumber(data.lat ?? data.state_lat ?? data.stateLat ?? null, 6);
+    const lon = formatNumber(data.lon ?? data.state_lon ?? data.stateLon ?? null, 6);
+    const alt = formatNumber(data.alt ?? data.state_alt ?? data.stateAlt ?? null, 2);
+    const relAlt = formatNumber(
+        data.relative_alt ?? data.state_relative_alt ?? data.state_relative_altitude ?? null,
+        2
+    );
+    const baroAlt = formatNumber(
+        data.baro_alt ?? data.state_baro_alt ?? data.alt ?? data.state_alt ?? null,
+        2
+    );
+    const heading = formatNumber(data.heading ?? data.state_heading ?? null, 1);
+    gpsBody.innerHTML = `
+        <div>Mode: ${modeText}</div>
+        <div>Lat: ${lat}</div>
+        <div>Lon: ${lon}</div>
+        <div>Baro/Alt: ${baroAlt} m</div>
+        <div>Alt Rel: ${relAlt} m</div>
+        <div>Heading: ${heading}°</div>
+    `;
+}
+
+function initControlPanel() {
+    const takeoffBtn = document.getElementById("btn-takeoff");
+    const modeButtons = [
+        { id: "btn-mode-guided", mode: "GUIDED" },
+        { id: "btn-mode-auto", mode: "AUTO" },
+        { id: "btn-mode-rtl", mode: "RTL" },
+    ];
+    const calibrateToggle = document.getElementById("calibrate-toggle");
+    const slamToggle = document.getElementById("slam2gps-toggle");
+    const saveCsvBtn = document.getElementById("btn-save-csv");
+    const visualSlamToggle = document.getElementById("visual-slam-toggle");
+
+    if (takeoffBtn) {
+        takeoffBtn.addEventListener("click", () => {
+            if (!window.socket) {
+                alert("Socket belum siap.");
+                return;
+            }
+            takeoffBtn.disabled = true;
+            window.socket.emit("takeoff_request", {}, (response = {}) => {
+                takeoffBtn.disabled = false;
+                if (response.ok) {
+                    alert("Takeoff sequence sent.");
+                } else {
+                    alert(response.error || "Gagal menjalankan takeoff.");
+                }
+            });
+        });
+    }
+    modeButtons.forEach(({ id, mode }) => {
+        const btn = document.getElementById(id);
+        if (!btn) {
+            return;
+        }
+        btn.addEventListener("click", () => {
+            if (!window.socket) {
+                alert("Socket belum siap.");
+                return;
+            }
+            btn.disabled = true;
+            window.socket.emit("mode_change_request", { mode }, (response = {}) => {
+                btn.disabled = false;
+                if (response.ok) {
+                    alert(`Mode set to ${response.mode || mode}`);
+                } else {
+                    alert(response.error || "Gagal mengganti mode.");
+                }
+            });
+        });
+    });
+    if (calibrateToggle) {
+        calibrateToggle.addEventListener("click", () => {
+            calibrateActive = !calibrateActive;
+            updateCalibrateButton();
+            alert(
+                calibrateActive
+                    ? "Calibration activated"
+                    : "Calibration deactivated"
+            );
+        });
+        updateCalibrateButton();
+    }
+    if (slamToggle) {
+        slamToggle.addEventListener("click", () => {
+            slam2gpsActive = !slam2gpsActive;
+            updateSlamToggleButton();
+            alert(
+                slam2gpsActive
+                    ? "SLAM2GPS mode activated"
+                    : "SLAM2GPS mode deactivated"
+            );
+        });
+        updateSlamToggleButton();
+    }
+    if (visualSlamToggle) {
+        visualSlamToggle.addEventListener("click", () => {
+            visualSlamActive = !visualSlamActive;
+            updateVisualSlamButton();
+            alert(
+                visualSlamActive
+                    ? "Visual SLAM activated"
+                    : "Visual SLAM deactivated"
+            );
+        });
+        updateVisualSlamButton();
+    }
+    if (saveCsvBtn) {
+        saveCsvBtn.addEventListener("click", () => {
+            if (!window.socket) {
+                alert("Socket belum siap.");
+                return;
+            }
+            saveCsvBtn.disabled = true;
+            if (!csvRecording) {
+                window.socket.emit("csv_logging", { action: "start" }, (response = {}) => {
+                    saveCsvBtn.disabled = false;
+                    if (response.ok) {
+                        csvRecording = true;
+                        saveCsvBtn.textContent = "Stop CSV";
+                        saveCsvBtn.classList.add("csv-active");
+                    } else {
+                        alert(response.error || "Gagal memulai rekam CSV.");
+                    }
+                });
+            } else {
+                window.socket.emit("csv_logging", { action: "stop" }, (response = {}) => {
+                    saveCsvBtn.disabled = false;
+                    if (response.ok && response.csv) {
+                        triggerCsvDownload(response.csv, response.fileName || "slam-log.csv");
+                        csvRecording = false;
+                        saveCsvBtn.textContent = "Save CSV";
+                        saveCsvBtn.classList.remove("csv-active");
+                    } else {
+                        alert(response.error || "Gagal menghentikan rekam CSV.");
+                    }
+                });
+            }
+        });
+    }
+}
+
+function updateSlamToggleButton() {
+    const slamToggle = document.getElementById("slam2gps-toggle");
+    if (!slamToggle) {
+        return;
+    }
+    if (slam2gpsActive) {
+        slamToggle.classList.remove("inactive");
+        slamToggle.classList.add("active");
+        slamToggle.textContent = "SLAM2GPS";
+    } else {
+        slamToggle.classList.remove("active");
+        slamToggle.classList.add("inactive");
+        slamToggle.textContent = "SLAM2GPS";
+    }
+}
+
+function updateCalibrateButton() {
+    const calibrateToggle = document.getElementById("calibrate-toggle");
+    if (!calibrateToggle) {
+        return;
+    }
+    if (calibrateActive) {
+        calibrateToggle.classList.remove("inactive");
+        calibrateToggle.classList.add("active");
+    } else {
+        calibrateToggle.classList.remove("active");
+        calibrateToggle.classList.add("inactive");
+    }
+}
+
+function updateVisualSlamButton() {
+    const visualSlamToggle = document.getElementById("visual-slam-toggle");
+    if (!visualSlamToggle) {
+        return;
+    }
+    visualSlamToggle.textContent = "Visual-SLAM";
+    if (visualSlamActive) {
+        visualSlamToggle.classList.remove("inactive");
+        visualSlamToggle.classList.add("active");
+    } else {
+        visualSlamToggle.classList.remove("active");
+        visualSlamToggle.classList.add("inactive");
+    }
+}
+
+window.updateMavlinkPanel = updateMavlinkPanel;
+
+function triggerCsvDownload(base64Data, fileName) {
+    try {
+        const byteCharacters = atob(base64Data);
+        const byteNumbers = new Array(byteCharacters.length);
+        for (let i = 0; i < byteCharacters.length; i++) {
+            byteNumbers[i] = byteCharacters.charCodeAt(i);
+        }
+        const byteArray = new Uint8Array(byteNumbers);
+        const blob = new Blob([byteArray], { type: "text/csv;charset=utf-8;" });
+        const url = URL.createObjectURL(blob);
+        const link = document.createElement("a");
+        link.href = url;
+        link.download = fileName || `slam-log-${Date.now()}.csv`;
+        document.body.appendChild(link);
+        link.click();
+        document.body.removeChild(link);
+        URL.revokeObjectURL(url);
+    } catch (error) {
+        console.error("Failed to download CSV", error);
+        alert("Gagal menyimpan file CSV.");
+    }
+}
+
+function scheduleTelemetryPoll() {
+    if (telemetryPollTimer) {
+        return;
+    }
+    const poll = () => {
+        fetch("/api/telemetry")
+            .then((res) => {
+                if (!res.ok) {
+                    throw new Error("Telemetry fetch failed");
+                }
+                return res.json();
+            })
+            .then((data) => {
+                if (typeof updateMavlinkPanel === "function") {
+                    updateMavlinkPanel(data);
+                }
+            })
+            .catch(() => {
+                // ignore fetch errors
+            });
+    };
+    poll();
+    telemetryPollTimer = setInterval(poll, 1000);
 }
 
 // calculate inverse of se3 pose matrix
